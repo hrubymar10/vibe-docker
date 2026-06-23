@@ -1,0 +1,701 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_DIR="$PROJECT_DIR/config"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-vibe-docker}"
+CONTAINER_NAME="vibe-docker"
+CONTAINER_USER="${HOST_USER:-$(whoami)}"
+SSH_RELAY_PID_FILE="${HOME}/.vibe-docker-ssh-relay.pid"
+SSH_RELAY_PORT=19922
+MIN_API_VERSION="1.44"
+BEEPER_PID_FILE="${HOME}/.vibe-docker-beeper.pid"
+AWS_PROXY_MIGRATION_CHECK=false
+
+# ── Compose file list (base + optional local override) ───────────
+COMPOSE_FILES=(-f "$PROJECT_DIR/docker-compose.yml")
+if [[ -f "$CONFIG_DIR/docker-compose.local.yml" ]]; then
+  COMPOSE_FILES+=(-f "$CONFIG_DIR/docker-compose.local.yml")
+else
+  echo "Note: no config/docker-compose.local.yml found. Only base volumes will be mounted." >&2
+  echo "  cp config/docker-compose.local.example.yml config/docker-compose.local.yml" >&2
+fi
+
+if [[ ! -f "$CONFIG_DIR/vibe-notifier" ]]; then
+  echo "Note: no config/vibe-notifier found. Copying example (no-op by default)." >&2
+  cp "$CONFIG_DIR/vibe-notifier.example" "$CONFIG_DIR/vibe-notifier"
+  chmod +x "$CONFIG_DIR/vibe-notifier"
+fi
+
+# GPU passthrough (opt-in via DOCKER_GPU=all or DOCKER_GPU=0,1 etc.)
+if [[ -n "${DOCKER_GPU:-}" ]]; then
+  GPU_OVERRIDE=$(mktemp "${TMPDIR:-/tmp}/vibe-docker-gpu.XXXXXX")
+  if [[ "$DOCKER_GPU" == "all" ]]; then
+    cat > "$GPU_OVERRIDE" <<YAMLEOF
+services:
+  vibe:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+YAMLEOF
+  else
+    cat > "$GPU_OVERRIDE" <<YAMLEOF
+services:
+  vibe:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${DOCKER_GPU}']
+              capabilities: [gpu]
+YAMLEOF
+  fi
+  COMPOSE_FILES+=(-f "$GPU_OVERRIDE")
+fi
+
+# Mount global context files if they exist
+for file in "$HOME/AGENTS.md" "$HOME/CLAUDE.md"; do
+  if [[ -f "$file" ]]; then
+    override=$(mktemp "${TMPDIR:-/tmp}/vibe-docker-context.XXXXXX")
+    base=$(basename "$file")
+    cat > "$override" <<YAMLEOF
+services:
+  vibe:
+    volumes:
+      - ${file}:${HOST_HOME:-${HOME}}/${base}:ro
+YAMLEOF
+    COMPOSE_FILES+=(-f "$override")
+  fi
+done
+
+# Mount ~/.ssh/known_hosts if it exists (for SSH auth)
+if [[ -f "$HOME/.ssh/known_hosts" ]]; then
+  SSH_OVERRIDE=$(mktemp "${TMPDIR:-/tmp}/vibe-docker-ssh.XXXXXX")
+  cat > "$SSH_OVERRIDE" <<YAMLEOF
+services:
+  vibe:
+    volumes:
+      - ${HOME}/.ssh/known_hosts:${HOST_HOME:-${HOME}}/.ssh/known_hosts:ro
+YAMLEOF
+  COMPOSE_FILES+=(-f "$SSH_OVERRIDE")
+fi
+
+# Mount ~/.agents if it exists (skills directory used by vibe)
+if [[ -d "$HOME/.agents" ]]; then
+  AGENTS_OVERRIDE=$(mktemp "${TMPDIR:-/tmp}/vibe-docker-agents.XXXXXX")
+  cat > "$AGENTS_OVERRIDE" <<YAMLEOF
+services:
+  vibe:
+    volumes:
+      - ${HOME}/.agents:${HOST_HOME:-${HOME}}/.agents
+YAMLEOF
+  COMPOSE_FILES+=(-f "$AGENTS_OVERRIDE")
+fi
+
+# ── Exclude masking (hide sensitive files/dirs from container) ────
+apply_excludes() {
+  local local_file="$CONFIG_DIR/docker-compose.local.yml"
+  [[ -f "$local_file" ]] || return 0
+
+  local in_block=false patterns=()
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^x-excludes: ]]; then
+      in_block=true
+      continue
+    fi
+    if $in_block; then
+      if [[ "$line" =~ ^[[:space:]]*-[[:space:]]+(.*) ]]; then
+        local pat="${BASH_REMATCH[1]}"
+        pat="${pat//\$\{HOST_USER\}/$HOST_USER}"
+        pat="${pat//\$HOST_USER/$HOST_USER}"
+        pat="${pat//\$\{HOST_HOME\}/$HOST_HOME}"
+        pat="${pat//\$HOST_HOME/$HOST_HOME}"
+        pat="${pat//\$\{HOME\}/$HOME}"
+        pat="${pat//\$HOME/$HOME}"
+        patterns+=("$pat")
+      else
+        break
+      fi
+    fi
+  done < "$local_file"
+
+  [[ ${#patterns[@]} -eq 0 ]] && return 0
+
+  local vol_entries=() tmpfs_entries=() count=0
+  for pat in "${patterns[@]}"; do
+    local expanded
+    expanded=$(compgen -G "$pat" 2>/dev/null || true)
+    while IFS= read -r path; do
+      [[ -z "$path" ]] && continue
+      if [[ -d "$path" ]]; then
+        tmpfs_entries+=("$path")
+        ((count++)) || true
+      elif [[ -f "$path" ]]; then
+        vol_entries+=("$path")
+        ((count++)) || true
+      fi
+    done <<< "$expanded"
+  done
+
+  [[ $count -eq 0 ]] && return 0
+
+  local tmpfile
+  tmpfile=$(mktemp "${TMPDIR:-/tmp}/vibe-docker-excludes.XXXXXX")
+  echo 'services:' > "$tmpfile"
+  echo '  vibe:' >> "$tmpfile"
+
+  if [[ ${#vol_entries[@]} -gt 0 ]]; then
+    echo '    volumes:' >> "$tmpfile"
+    for f in "${vol_entries[@]}"; do
+      echo "      - /dev/null:${f}:ro" >> "$tmpfile"
+    done
+  fi
+
+  if [[ ${#tmpfs_entries[@]} -gt 0 ]]; then
+    echo '    tmpfs:' >> "$tmpfile"
+    for d in "${tmpfs_entries[@]}"; do
+      echo "      - ${d}:ro,size=0" >> "$tmpfile"
+    done
+  fi
+
+  COMPOSE_FILES+=(-f "$tmpfile")
+  echo "Exclude masking: $count paths hidden" >&2
+}
+
+die() { echo "Error: $1" >&2; exit 1; }
+
+normalize_env_key() {
+  local key="$1"
+  key="${key#"${key%%[![:space:]]*}"}"
+  key="${key%"${key##*[![:space:]]}"}"
+  if [[ "$key" =~ ^export[[:space:]]+(.+)$ ]]; then
+    key="${BASH_REMATCH[1]}"
+  fi
+  printf '%s\n' "$key"
+}
+
+aws_ai_proxy_enabled() {
+  case "${AWS_AI_PROXY_ENABLED:-false}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+parse_aws_ai_proxy_profiles() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -r '.[] | "\(.name):\(.region)"' | paste -sd, -
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json,sys; print(",".join(f"{p[\"name\"]}:{p[\"region\"]}" for p in json.load(sys.stdin)))'
+  else
+    return 127
+  fi
+}
+
+prepare_aws_ai_proxy_env() {
+  export AWS_AI_PROXY_ENABLED="${AWS_AI_PROXY_ENABLED:-false}"
+  export AWS_AI_PROXY_URL="${AWS_AI_PROXY_URL:-http://host.docker.internal:9998}"
+  export AWS_AI_PROXY_PROFILE_CONFIG=""
+
+  aws_ai_proxy_enabled || return 0
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Warning: AWS_AI_PROXY_ENABLED is set, but curl is not available; skipping AWS proxy profile fetch." >&2
+    return 0
+  fi
+
+  local profiles_json profiles
+  profiles_json=$(curl -fsS --max-time 2 "$AWS_AI_PROXY_URL/profiles" 2>/dev/null) || {
+    echo "Warning: could not fetch AWS AI proxy profiles from $AWS_AI_PROXY_URL/profiles; continuing without AWS proxy profiles." >&2
+    return 0
+  }
+  profiles=$(printf '%s' "$profiles_json" | parse_aws_ai_proxy_profiles 2>/dev/null) || {
+    echo "Warning: could not parse AWS AI proxy profiles from $AWS_AI_PROXY_URL/profiles; install jq or python3." >&2
+    return 0
+  }
+  if [[ -z "$profiles" ]]; then
+    echo "Warning: AWS AI proxy returned no profiles from $AWS_AI_PROXY_URL/profiles." >&2
+    return 0
+  fi
+  export AWS_AI_PROXY_PROFILE_CONFIG="$profiles"
+  echo "AWS AI proxy profiles fetched: $profiles"
+}
+
+legacy_aws_proxy_env_vars() {
+  local vars=""
+  [[ -n "${AWS_CRED_PROXY_PROFILES+x}" ]] && vars="AWS_CRED_PROXY_PROFILES"
+  [[ -n "${AWS_CRED_PROXY_PORT+x}" ]] && vars="${vars:+$vars,}AWS_CRED_PROXY_PORT"
+  [[ -n "$vars" ]] || return 0
+  printf '%s\n' "$vars"
+}
+
+legacy_aws_proxy_config_vars() {
+  local env_file="$CONFIG_DIR/.env"
+  [[ -f "$env_file" ]] || return 0
+
+  local line var vars=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(AWS_CRED_PROXY_PROFILES|AWS_CRED_PROXY_PORT)= ]]; then
+      var="${BASH_REMATCH[2]}"
+      [[ ",$vars," == *",$var,"* ]] || vars="${vars:+$vars,}$var"
+    fi
+  done < "$env_file"
+
+  [[ -n "$vars" ]] || return 0
+  printf '%s\n' "$vars"
+}
+
+print_aws_proxy_migration_steps() {
+  cat >&2 <<'EOF'
+Switch to aws-ai-proxy:
+  1. Install and run aws-ai-proxy on the host: https://github.com/hrubymar10/aws-ai-proxy
+  2. Configure ~/.aws-ai-proxy/config with AWS_AI_PROXY_PROFILES=<profile names>.
+  3. Set AWS_AI_PROXY_ENABLED=true in config/.env.
+  4. Set AWS_AI_PROXY_URL=http://host.docker.internal:9998 if you use a non-default URL.
+EOF
+}
+
+comment_legacy_aws_proxy_config() {
+  local env_file="$CONFIG_DIR/.env"
+  if [[ ! -f "$env_file" || -z "$(legacy_aws_proxy_config_vars)" ]]; then
+    echo "No active AWS_CRED_PROXY_* lines found in config/.env. Remove legacy variables from your shell profile or launch environment." >&2
+    return 0
+  fi
+
+  local backup tmp line
+  backup="$env_file.bak.$(date +%Y%m%d%H%M%S)"
+  tmp=$(mktemp "${TMPDIR:-/tmp}/vibe-docker-env.XXXXXX")
+  cp "$env_file" "$backup"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ ! "$line" =~ ^[[:space:]]*# ]] \
+      && [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?(AWS_CRED_PROXY_PROFILES|AWS_CRED_PROXY_PORT)= ]]; then
+      printf '# deprecated: %s\n' "$line"
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$env_file" > "$tmp"
+  mv "$tmp" "$env_file"
+  echo "Commented legacy AWS_CRED_PROXY_* lines in config/.env (backup: $backup)." >&2
+}
+
+check_aws_proxy_migration() {
+  "$AWS_PROXY_MIGRATION_CHECK" || return 0
+  aws_ai_proxy_enabled && return 0
+
+  local env_vars="$1"
+  local config_vars
+  config_vars=$(legacy_aws_proxy_config_vars)
+  [[ -n "$env_vars" || -n "$config_vars" ]] || return 0
+
+  echo "Warning: legacy AWS_CRED_PROXY_* settings are ignored by vibe-docker." >&2
+  [[ -n "$env_vars" ]] && echo "  process environment: $env_vars" >&2
+  [[ -n "$config_vars" ]] && echo "  config/.env: $config_vars" >&2
+
+  if [[ -t 0 ]]; then
+    echo "Choose: [r] comment them out of config/.env, [s] show aws-ai-proxy steps, [i] ignore once." >&2
+    local choice
+    read -r -p "AWS proxy migration [r/s/i]: " choice || choice=""
+    case "$choice" in
+      r|R) comment_legacy_aws_proxy_config ;;
+      s|S) print_aws_proxy_migration_steps ;;
+      *) echo "Continuing without AWS proxy migration changes." >&2 ;;
+    esac
+  else
+    print_aws_proxy_migration_steps
+  fi
+}
+
+# ── Docker API version check ────────────────────────────────────
+check_docker_api_version() {
+  docker info >/dev/null 2>&1 || die 'Docker is not running.'
+  local api_version
+  api_version=$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null) || true
+  if [[ -z "$api_version" ]]; then
+    echo 'Warning: could not determine Docker API version' >&2
+    return 0
+  fi
+  local IFS='.'
+  local -a min cur
+  read -r -a min <<< "$MIN_API_VERSION"
+  read -r -a cur <<< "$api_version"
+  if (( cur[0] < min[0] || (cur[0] == min[0] && cur[1] < min[1]) )); then
+    die "Docker API version $api_version is too old (minimum: $MIN_API_VERSION). Please upgrade Docker."
+  fi
+}
+
+# ── Pre-flight checks for commands that need a running container ─
+check_container() {
+  docker info >/dev/null 2>&1 || die 'Docker is not running.'
+  local status
+  status=$(docker inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null) \
+    || die "Container '$CONTAINER_NAME' does not exist. Run: $(basename "$0") start"
+  [[ "$status" == 'running' ]] \
+    || die "Container '$CONTAINER_NAME' is $status. Run: $(basename "$0") start"
+}
+
+check_mount() {
+  local workdir="$1"
+  local mounts
+  mounts=$(docker inspect --format '{{range .Mounts}}{{.Source}} {{end}}' "$CONTAINER_NAME")
+  for src in $mounts; do
+    [[ "$workdir" == "$src" || "$workdir" == "$src/"* ]] && return 0
+  done
+  die "Directory '$workdir' is not mounted in container.
+Add it to config/docker-compose.local.yml volumes, e.g.:
+  - \${HOST_HOME}/${workdir##*/}:\${HOST_HOME}/${workdir##*/}"
+}
+
+# ── Export environment for docker compose ────────────────────────
+setup_env() {
+  local legacy_aws_proxy_env_source
+  legacy_aws_proxy_env_source=$(legacy_aws_proxy_env_vars)
+
+  if [[ -f "$CONFIG_DIR/.env" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      [[ -z "${line// /}" ]] && continue
+      local key="${line%%=*}"
+      local val="${line#*=}"
+      key=$(normalize_env_key "$key")
+      if   [[ "$val" == '"'*'"' ]]; then val="${val#\"}"; val="${val%\"}"
+      elif [[ "$val" == "'"*"'" ]]; then val="${val#\'}"; val="${val%\'}"; fi
+      if [[ -z "${!key:-}" ]]; then
+        export "$key=$val"
+      fi
+    done < "$CONFIG_DIR/.env"
+  fi
+  check_aws_proxy_migration "$legacy_aws_proxy_env_source"
+
+  export HOST_USER HOST_UID HOST_HOME
+  HOST_USER="${HOST_USER:-$(whoami)}"
+  HOST_UID="${HOST_UID:-$(id -u)}"
+  HOST_HOME="${HOST_HOME:-$HOME}"
+  [[ "$HOST_HOME" == /* ]] || die "HOST_HOME must be an absolute path: $HOST_HOME"
+
+  export VIBE_HOME_HOST
+  VIBE_HOME_HOST="${VIBE_HOME:-$HOST_HOME/.vibe}"
+  [[ "$VIBE_HOME_HOST" == /* ]] || die "VIBE_HOME must be an absolute path: $VIBE_HOME_HOST"
+  mkdir -p "$VIBE_HOME_HOST"
+
+  export GO_VERSION
+  GO_VERSION=$(go version 2>/dev/null | awk '{print $3}' | sed 's/\(go[0-9]*\.[0-9]*\.[0-9]*\).*/\1/') || true
+  if [[ -z "$GO_VERSION" ]]; then
+    echo 'Warning: go not found on host, using default go1.26.0' >&2
+    GO_VERSION='go1.26.0'
+  fi
+
+  export GOPATH
+  GOPATH=$(go env GOPATH 2>/dev/null) || GOPATH="${HOME}/go"
+
+  if [[ -z "${GITHUB_TOKEN:-}" ]] && command -v gh &>/dev/null; then
+    GITHUB_TOKEN=$(gh auth token 2>/dev/null) || true
+  fi
+  export GITHUB_TOKEN
+
+  # GitLab token: prefer GITLAB_TOKEN env var, fall back to the host glab CLI.
+  # The token is only needed for the glab CLI (GitLab API) — git itself
+  # authenticates over SSH via agent forwarding and needs no token.
+  if [[ -z "${GITLAB_TOKEN:-}" ]]; then
+    if command -v glab &>/dev/null; then
+      GITLAB_TOKEN=$(glab config get token --host "${GITLAB_HOST:-gitlab.com}" 2>/dev/null) || true
+    fi
+  fi
+  export GITLAB_TOKEN
+  export GITLAB_HOST
+
+  if [[ -z "${GIT_USER_NAME:-}" ]]; then
+    GIT_USER_NAME=$(git config user.name 2>/dev/null) || true
+    export GIT_USER_NAME
+  fi
+  if [[ -z "${GIT_USER_EMAIL:-}" ]]; then
+    GIT_USER_EMAIL=$(git config user.email 2>/dev/null) || true
+    export GIT_USER_EMAIL
+  fi
+
+  if [[ -z "${GONOSUMDB:-}" && -n "${GOPRIVATE:-}" ]]; then
+    export GONOSUMDB="$GOPRIVATE"
+  fi
+
+  export CONTAINER_SHELL
+  resolve_shell() {
+    local name="$1"
+    name=$(basename "$name")
+    case "$name" in
+      ash)           echo '/bin/ash' ;;
+      sh)            echo '/bin/sh' ;;
+      bash)          echo '/bin/bash' ;;
+      dash)          echo '/usr/bin/dash' ;;
+      elvish)        echo '/usr/bin/elvish' ;;
+      fish)          echo '/usr/bin/fish' ;;
+      ksh|loksh)     echo '/bin/ksh' ;;
+      mksh)          echo '/bin/mksh' ;;
+      nu|nushell)    echo '/usr/bin/nu' ;;
+      oksh)          echo '/usr/bin/oksh' ;;
+      tcsh|csh)      echo '/bin/tcsh' ;;
+      yash)          echo '/usr/bin/yash' ;;
+      zsh)           echo '/bin/zsh' ;;
+      *)             echo '/bin/bash' ;;
+    esac
+  }
+  if [[ -n "${CONTAINER_SHELL:-}" ]]; then
+    CONTAINER_SHELL=$(resolve_shell "$CONTAINER_SHELL")
+  else
+    CONTAINER_SHELL=$(resolve_shell "${SHELL:-bash}")
+  fi
+
+  if [[ -S "${SSH_AUTH_SOCK:-}" ]]; then
+    export SSH_RELAY_HOST='host.docker.internal'
+    export SSH_RELAY_PORT
+  fi
+
+  apply_excludes
+
+  # Validate compose files — surfaces YAML parse errors with a clear message
+  # instead of silently failing inside the ALLOWED_BIND_MOUNTS pipeline.
+  validate_compose_files
+
+  if [[ -z "${ALLOWED_BIND_MOUNTS:-}" ]]; then
+    ALLOWED_BIND_MOUNTS=$(
+      docker compose "${COMPOSE_FILES[@]}" config 2>/dev/null \
+        | sed -n '/^  vibe:/,/^  [a-z]/p' \
+        | grep 'source:' \
+        | awk '{print $2}' \
+        | grep '^/' \
+        | paste -sd, -
+    )
+    export ALLOWED_BIND_MOUNTS
+  fi
+}
+
+# ── Compose file validation ──────────────────────────────────────
+# Runs `docker compose config -q` against the merged file set and, on
+# failure, prints the offending files plus the parser's stderr so the
+# user can see exactly what's wrong (e.g. malformed docker-compose.local.yml).
+validate_compose_files() {
+  local errors
+  if ! errors=$(docker compose "${COMPOSE_FILES[@]}" config -q 2>&1); then
+    {
+      echo "Error: invalid Docker Compose configuration."
+      echo ""
+      echo "Files checked:"
+      local i
+      for ((i = 0; i < ${#COMPOSE_FILES[@]}; i++)); do
+        [[ "${COMPOSE_FILES[$i]}" == "-f" ]] && echo "  - ${COMPOSE_FILES[$((i + 1))]}"
+      done
+      echo ""
+      echo "Details:"
+      printf '%s\n' "$errors" | sed 's/^/  /'
+    } >&2
+    exit 1
+  fi
+}
+
+# ── Beeper server management ─────────────────────────────────────
+start_beeper() {
+  if [[ -f "$BEEPER_PID_FILE" ]] && kill -0 "$(cat "$BEEPER_PID_FILE")" 2>/dev/null; then
+    echo "Beeper already running (PID $(cat "$BEEPER_PID_FILE"))"
+    return
+  fi
+
+  if ! command -v go &>/dev/null; then
+    echo 'Warning: go not found, skipping beeper' >&2
+    return
+  fi
+
+  local beeper_bin="$PROJECT_DIR/beeper/beeper"
+  echo 'Building beeper...'
+  go build -o "$beeper_bin" "$PROJECT_DIR/beeper/main.go"
+
+  "$beeper_bin" &
+  local pid=$!
+  echo "$pid" > "$BEEPER_PID_FILE"
+  echo "Beeper started (PID $pid) on http://${BEEPER_BIND:-127.0.0.1:9999} (allow: ${BEEPER_ALLOW:-127.0.0.0/8})"
+}
+
+stop_beeper() {
+  if [[ -f "$BEEPER_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$BEEPER_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      echo "Beeper stopped (PID $pid)"
+    fi
+    rm -f "$BEEPER_PID_FILE"
+  fi
+}
+
+beeper_status() {
+  if [[ -f "$BEEPER_PID_FILE" ]] && kill -0 "$(cat "$BEEPER_PID_FILE")" 2>/dev/null; then
+    echo "Beeper: running (PID $(cat "$BEEPER_PID_FILE"))"
+  else
+    echo 'Beeper: stopped'
+    rm -f "$BEEPER_PID_FILE" 2>/dev/null
+  fi
+}
+
+# ── SSH agent relay management ────────────────────────────────────
+start_ssh_relay() {
+  [[ -S "${SSH_AUTH_SOCK:-}" ]] || return 0
+
+  if [[ -f "$SSH_RELAY_PID_FILE" ]] && kill -0 "$(cat "$SSH_RELAY_PID_FILE")" 2>/dev/null; then
+    echo "SSH agent relay already running (PID $(cat "$SSH_RELAY_PID_FILE"))"
+    return
+  fi
+
+  if ! command -v socat &>/dev/null; then
+    echo 'Warning: socat not found on host, skipping SSH agent relay' >&2
+    return
+  fi
+
+  socat TCP-LISTEN:"$SSH_RELAY_PORT",fork,reuseaddr,bind=127.0.0.1 \
+    UNIX-CONNECT:"$SSH_AUTH_SOCK" &
+  local pid=$!
+  echo "$pid" > "$SSH_RELAY_PID_FILE"
+  echo "SSH agent relay started (PID $pid) on 127.0.0.1:$SSH_RELAY_PORT"
+}
+
+stop_ssh_relay() {
+  if [[ -f "$SSH_RELAY_PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$SSH_RELAY_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      echo "SSH agent relay stopped (PID $pid)"
+    fi
+    rm -f "$SSH_RELAY_PID_FILE"
+  fi
+}
+
+ssh_relay_status() {
+  if [[ -f "$SSH_RELAY_PID_FILE" ]] && kill -0 "$(cat "$SSH_RELAY_PID_FILE")" 2>/dev/null; then
+    echo "SSH relay: running (PID $(cat "$SSH_RELAY_PID_FILE")) on port $SSH_RELAY_PORT"
+  else
+    echo 'SSH relay: stopped'
+    rm -f "$SSH_RELAY_PID_FILE" 2>/dev/null
+  fi
+}
+
+# ── Commands ─────────────────────────────────────────────────────
+cmd_start() {
+  check_docker_api_version
+  AWS_PROXY_MIGRATION_CHECK=true
+  setup_env
+  AWS_PROXY_MIGRATION_CHECK=false
+  prepare_aws_ai_proxy_env
+  echo "Building image (GO_VERSION=${GO_VERSION})..."
+  docker compose "${COMPOSE_FILES[@]}" build
+  echo "Starting container (shell: ${CONTAINER_SHELL})..."
+  docker compose "${COMPOSE_FILES[@]}" up -d
+  start_ssh_relay
+  echo
+  echo "Container '${CONTAINER_NAME}' is running."
+  echo "  Interactive:  $(basename "$0") exec"
+  echo "  Shell:        $(basename "$0") shell"
+}
+
+cmd_stop() {
+  setup_env
+  echo 'Stopping container...'
+  docker compose "${COMPOSE_FILES[@]}" down
+  stop_ssh_relay
+}
+
+cmd_status() {
+  echo '=== Socket Proxy ==='
+  if docker inspect 'vibe-socket-proxy' --format '{{.State.Status}}' 2>/dev/null; then
+    docker inspect 'vibe-socket-proxy' --format 'Name: {{.Name}}  Status: {{.State.Status}}  Started: {{.State.StartedAt}}'
+  else
+    echo 'Not running'
+  fi
+  echo
+  echo '=== Filter Proxy ==='
+  if docker inspect 'vibe-filter-proxy' --format '{{.State.Status}}' 2>/dev/null; then
+    docker inspect 'vibe-filter-proxy' --format 'Name: {{.Name}}  Status: {{.State.Status}}  Started: {{.State.StartedAt}}'
+  else
+    echo 'Not running'
+  fi
+  echo
+  echo '=== Container ==='
+  if docker inspect "$CONTAINER_NAME" --format '{{.State.Status}}' 2>/dev/null; then
+    docker inspect "$CONTAINER_NAME" --format 'Name: {{.Name}}  Status: {{.State.Status}}  Started: {{.State.StartedAt}}'
+  else
+    echo 'Not running'
+  fi
+  echo
+  echo '=== Beeper ==='
+  beeper_status
+  echo
+  echo '=== SSH Relay ==='
+  ssh_relay_status
+}
+
+cmd_build_image() {
+  check_docker_api_version
+  AWS_PROXY_MIGRATION_CHECK=true
+  setup_env
+  AWS_PROXY_MIGRATION_CHECK=false
+  prepare_aws_ai_proxy_env
+  echo "Building image (GO_VERSION=${GO_VERSION})..."
+  docker compose "${COMPOSE_FILES[@]}" build
+}
+
+cmd_shell() {
+  check_container
+  local workdir
+  workdir="$(pwd)"
+  check_mount "$workdir"
+  local shell_cmd
+  shell_cmd=$(docker exec "$CONTAINER_NAME" printenv CONTAINER_SHELL 2>/dev/null) || shell_cmd='/bin/bash'
+  exec docker exec -it -u "$CONTAINER_USER" -w "$workdir" "$CONTAINER_NAME" "$shell_cmd"
+}
+
+cmd_exec() {
+  shift || true
+  exec "$PROJECT_DIR/bin/vibe-docker" "$@"
+}
+
+cmd_rebuild() {
+  check_docker_api_version
+  AWS_PROXY_MIGRATION_CHECK=true
+  setup_env
+  AWS_PROXY_MIGRATION_CHECK=false
+  prepare_aws_ai_proxy_env
+  echo "Rebuilding image from scratch (GO_VERSION=${GO_VERSION})..."
+  docker compose "${COMPOSE_FILES[@]}" build --no-cache
+  echo 'Restarting container...'
+  docker compose "${COMPOSE_FILES[@]}" up -d --force-recreate
+  start_ssh_relay
+  echo 'Done.'
+}
+
+case "${1:-}" in
+  start)   cmd_start ;;
+  stop)    cmd_stop ;;
+  status)  cmd_status ;;
+  build|build-image) cmd_build_image ;;
+  shell)   cmd_shell ;;
+  exec)    cmd_exec "$@" ;;
+  rebuild) cmd_rebuild ;;
+  beeper-start) start_beeper ;;
+  beeper-stop)  stop_beeper ;;
+  *)
+    echo "Usage: $(basename "$0") <command>"
+    echo
+    echo 'Commands:'
+    echo '  start     Build image, start container'
+    echo '  stop      Stop container'
+    echo '  status    Show container status'
+    echo '  build     Build image without starting'
+    echo '  shell     Shell into the container (auto-detects from host $SHELL)'
+    echo '  exec      Run vibe in the container'
+    echo '  rebuild        Rebuild image from scratch + restart'
+    echo '  beeper-start   Start host beeper server (port 9999)'
+    echo '  beeper-stop    Stop host beeper server'
+    exit 1
+    ;;
+esac

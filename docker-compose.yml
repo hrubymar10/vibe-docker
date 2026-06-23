@@ -1,0 +1,95 @@
+services:
+  socket-proxy:
+    image: wollomatic/socket-proxy:1
+    container_name: vibe-socket-proxy
+    command:
+      - '-listenip=0.0.0.0'
+      - '-allowfrom=vibe-filter-proxy'
+      - '-allowGET=/(v1\..{1,2}/)?(version|info|containers(/.*)?|images(/.*)?|networks(/.*)?|volumes(/.*)?|build.*|exec/.*|events.*|_ping)'
+      - '-allowPOST=/(v1\..{1,2}/)?(containers(/.*)?|images(/.*)?|networks(/.*)?|volumes(/.*)?|build.*|exec/.*|_ping)'
+      - '-allowPUT=/(v1\..{1,2}/)?(containers(/.*)?)'
+      - '-allowDELETE=/(v1\..{1,2}/)?(containers(/.*)?|images(/.*)?|networks(/.*)?|volumes(/.*)?)'
+      - '-allowHEAD=/(v1\..{1,2}/)?(containers(/.*)?|images(/.*)?|_ping)'
+      - '-allowbindmountfrom=${ALLOWED_BIND_MOUNTS}'
+      - '-loglevel=INFO'
+    user: '0'
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - vibe-internal-net
+    read_only: true
+    tmpfs:
+      - /run
+    restart: unless-stopped
+
+  filter-proxy:
+    container_name: vibe-filter-proxy
+    build:
+      context: ./docker-filter-proxy
+    environment:
+      DOCKER_FILTER_UPSTREAM: http://vibe-socket-proxy:2375
+      DOCKER_FILTER_LISTEN: 0.0.0.0:2375
+    depends_on:
+      - socket-proxy
+    networks:
+      - vibe-internal-net
+      - vibe-net
+    read_only: true
+    restart: unless-stopped
+
+  vibe:
+    container_name: vibe-docker
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        HOST_UID: ${HOST_UID}
+        HOST_USER: ${HOST_USER}
+        HOST_HOME: ${HOST_HOME}
+        GO_VERSION: ${GO_VERSION}
+        CONTAINER_SHELL: ${CONTAINER_SHELL:-/bin/bash}
+        EXTRA_PACKAGES: ${EXTRA_PACKAGES:-}
+        EXTRA_GO_PACKAGES: ${EXTRA_GO_PACKAGES:-}
+        EXTRA_NPM_PACKAGES: ${EXTRA_NPM_PACKAGES:-}
+        VIBE_VERSION: ${VIBE_VERSION:-}
+    volumes:
+      - ${VIBE_HOME_HOST}:${VIBE_HOME_HOST}
+      - ${GOPATH}/pkg:${HOST_HOME}/go/pkg
+      - ./gpg-keys:/run/gpg-keys:ro
+      - ./config/vibe-notifier:/usr/local/bin/vibe-notifier:ro
+      - ./config/custom-bin:/usr/local/custom-bin:ro
+    working_dir: ${HOST_HOME}
+    environment:
+      DOCKER_HOST: tcp://vibe-filter-proxy:2375
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+      GITLAB_HOST: ${GITLAB_HOST:-}
+      GIT_USER_NAME: ${GIT_USER_NAME:-}
+      GIT_USER_EMAIL: ${GIT_USER_EMAIL:-}
+      GIT_PROTECTED_BRANCHES: ${GIT_PROTECTED_BRANCHES:-main master}
+      GOPRIVATE: ${GOPRIVATE:-}
+      GONOSUMDB: ${GONOSUMDB:-}
+      GOPATH: ${HOST_HOME}/go
+      HOST_USER: ${HOST_USER}
+      HOST_HOME: ${HOST_HOME}
+      VIBE_HOME: ${VIBE_HOME_HOST}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      SSH_RELAY_HOST: ${SSH_RELAY_HOST:-}
+      SSH_RELAY_PORT: ${SSH_RELAY_PORT:-}
+      SSH_AUTH_SOCK: /tmp/ssh-agent.sock
+      CONTAINER_SHELL: ${CONTAINER_SHELL:-/bin/bash}
+      AWS_AI_PROXY_ENABLED: ${AWS_AI_PROXY_ENABLED:-false}
+      AWS_AI_PROXY_URL: ${AWS_AI_PROXY_URL:-http://host.docker.internal:9998}
+      AWS_AI_PROXY_PROFILE_CONFIG: ${AWS_AI_PROXY_PROFILE_CONFIG:-}
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    mem_limit: ${DOCKER_MEMORY_LIMIT:-0}
+    depends_on:
+      - filter-proxy
+    networks:
+      - vibe-net
+
+networks:
+  vibe-internal-net:
+  vibe-net:

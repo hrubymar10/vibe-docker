@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+confirm() {
+  local prompt="$1"
+  read -r -p "$prompt (Y/n) " answer
+  [[ -z "$answer" || "$answer" =~ ^[Yy]$ ]]
+}
+
+PR_NUMBER="${1:-}"
+
+if [[ -z "$PR_NUMBER" ]]; then
+  echo "Usage: $0 <pr-number>"
+  exit 1
+fi
+
+# 1. Ensure clean working tree
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "❌ Working tree is not clean. Commit or stash your changes."
+  exit 1
+fi
+
+# 2. Fetch PR metadata
+echo "🔍 Fetching PR #$PR_NUMBER metadata..."
+
+PR_JSON=$(gh pr view "$PR_NUMBER" --json baseRefName,headRefName,headRepositoryOwner,title)
+
+BASE_BRANCH=$(jq -r '.baseRefName' <<<"$PR_JSON")
+HEAD_BRANCH=$(jq -r '.headRefName' <<<"$PR_JSON")
+HEAD_OWNER=$(jq -r '.headRepositoryOwner.login' <<<"$PR_JSON")
+PR_TITLE=$(jq -r '.title' <<<"$PR_JSON")
+
+# Detect fork PRs by comparing head owner to the current repo owner
+REPO_OWNER=$(gh repo view --json owner -q '.owner.login')
+IS_FORK=false
+if [[ "$HEAD_OWNER" != "$REPO_OWNER" ]]; then
+  IS_FORK=true
+fi
+
+echo "✔ Base branch : $BASE_BRANCH"
+echo "✔ Head branch : $HEAD_BRANCH"
+if $IS_FORK; then
+  echo "✔ Fork        : $HEAD_OWNER (will fetch via PR ref)"
+fi
+echo ""
+
+if ! confirm "Merge PR #$PR_NUMBER - $PR_TITLE?"; then
+  echo "Aborted."
+  exit 0
+fi
+
+# 3. Fetch branches
+echo "📥 Fetching branches..."
+git fetch origin "$BASE_BRANCH"
+if $IS_FORK; then
+  git fetch origin "refs/pull/$PR_NUMBER/head:refs/remotes/origin/pr/$PR_NUMBER"
+  PR_REF="origin/pr/$PR_NUMBER"
+else
+  git fetch origin "$HEAD_BRANCH"
+  PR_REF="origin/$HEAD_BRANCH"
+fi
+
+# 4. Checkout base branch
+echo "🔀 Checking out base branch..."
+git checkout "$BASE_BRANCH"
+
+# 5. Ensure base branch is up to date
+git pull --ff-only origin "$BASE_BRANCH"
+
+# 6. Ensure fast-forward is possible
+if ! git merge-base --is-ancestor "origin/$BASE_BRANCH" "$PR_REF"; then
+  echo "❌ Fast-forward merge not possible."
+  echo "   The PR branch is not strictly ahead of the base branch."
+  exit 1
+fi
+
+# 7. Fast-forward merge
+echo "🚀 Fast-forward merging PR..."
+git merge --ff-only "$PR_REF"
+
+# 8. Push
+echo "📤 Pushing to origin..."
+git push origin "$BASE_BRANCH"
+
+echo "✅ PR #$PR_NUMBER fast-forward merged successfully."
+echo "🔒 Commits preserved. Signatures intact."
+
+# 9. Optionally delete local branch
+if git rev-parse --verify "$HEAD_BRANCH" &>/dev/null; then
+  echo ""
+  if confirm "Delete local branch '$HEAD_BRANCH'?"; then
+    git branch -d "$HEAD_BRANCH"
+    echo "✔ Local branch '$HEAD_BRANCH' deleted."
+  fi
+fi
+
+# 10. Optionally delete remote branch (only for same-repo PRs)
+if ! $IS_FORK; then
+  if git ls-remote --exit-code --heads origin "$HEAD_BRANCH" &>/dev/null; then
+    echo ""
+    if confirm "Delete remote branch 'origin/$HEAD_BRANCH'?"; then
+      git push origin --delete "$HEAD_BRANCH"
+      echo "✔ Remote branch '$HEAD_BRANCH' deleted."
+    fi
+  fi
+fi
+
+# 11. Prune stale remote references
+echo "🧹 Pruning stale remote references..."
+git fetch --prune
