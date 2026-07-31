@@ -139,6 +139,11 @@ You usually do not need this, but it is useful for:
 - overriding `VIBE_HOME`
 - setting protected branches
 
+| Git push setting | Default | Purpose |
+|------------------|---------|---------|
+| `GIT_PROTECTED_BRANCHES` | `main master` | Branch names blocked by the in-container git wrapper. |
+| `GIT_PROTECTED_BRANCH_EXEMPT_REPOS` | empty | Space-separated `host/org/repo` destinations allowed to receive protected branches; tag pushes remain blocked. |
+
 ### 6. Start the container
 
 ```bash
