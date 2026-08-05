@@ -19,8 +19,8 @@ The socket-proxy `allowbindmountfrom` restriction checks `HostConfig.Binds` and 
 **Impact:** Read/write access to arbitrary host paths through the Docker API.
 
 **Mitigations in place:**
-- `scripts/docker-wrapper.sh` blocks `docker run`, `docker build`, `docker cp` at the CLI layer. (`docker volume` is still allowlisted; this is the residual gap exploited above.)
-- The real docker binary is at `/usr/libexec/docker-real/docker` and `/usr/bin/docker` is the wrapper, so the allowlist cannot be bypassed by invoking the binary at an absolute path.
+- `scripts/docker-wrapper.sh` blocks `docker run` and `docker cp` at the CLI layer. `docker build` and `docker buildx` are allowed; builds targeting a sibling sandbox image name emit a warning but proceed. (`docker volume` is still allowlisted; this is the residual gap exploited above.)
+- The real docker binary is at `/usr/libexec/docker-real/docker` and remains executable, but direct calls still reach the filtering proxy and cannot bypass its container policy.
 - Exploitation requires raw HTTP requests to `tcp://vibe-filter-proxy:2375`, not normal `docker` CLI usage
 
 ## 2. Git push to feature branches and force push
@@ -119,15 +119,20 @@ The container has unrestricted outbound network access.
 **Status:** Accepted trade-off  
 **Severity:** Medium
 
-The socket-proxy allows a substantial subset of the Docker API. The filter proxy only inspects container-create request bodies.
+The socket-proxy allows a substantial subset of the Docker API, including BuildKit routes. The filter proxy inspects container-create request bodies and rejects non-canonical API paths.
 
 **Impact:** vibe can still create/delete containers, pull/delete images, and create/delete networks and volumes via raw API requests. Dangerous container settings are filtered, but the broader API surface remains available.
 
 **Mitigations in place:**
 - `scripts/docker-wrapper.sh` restricts normal CLI usage to a safer allowlist
 - `docker-filter-proxy` blocks dangerous container-create configurations
+- `docker-filter-proxy` rejects decoded paths that differ from their canonical form before forwarding
 - socket-proxy restricts bind mounts to allowed directories
 - practical exploitation requires raw HTTP, not normal CLI flows
+
+An image-tag allowlist for builds was considered and rejected. It would address deliberate image-poisoning persistence, which is outside this project's stated bad-prompts-not-bad-actors threat model, while breaking legitimate generic BuildKit workflows and requiring per-project policy. The wrapper instead gives a non-blocking warning when a tag exactly matches `claude-docker`, `codex-docker`, `pi-docker`, or `vibe-docker`.
+
+During that investigation, an encoded `/%2Fbuild` request demonstrated a real path-normalization mismatch: `http.ServeMux` let the decoded double-slash path reach the handler, and the reverse proxy normalized it before forwarding, bypassing path-based filters. The filter proxy now rejects every request whose decoded path differs from `path.Clean`; adversarial tests pin double-slash, dot-segment, and encoded-slash forms.
 
 ## 8. `docker inspect` and `docker logs` remain informative
 
@@ -162,8 +167,8 @@ vibe packages, extensions, prompts, and skills can influence agent behavior and 
 
 ```text
 vibe process
-  └─ docker-wrapper.sh      CLI filter: blocks run/build/cp/volume
-      └─ docker-filter-proxy  Body inspection: blocks privileged/host-ns/caps
+  └─ docker-wrapper.sh      CLI filter; warns on sibling sandbox image tags
+      └─ docker-filter-proxy  Canonical-path + container-body inspection
           └─ socket-proxy      URL filter + bind mount allowlist
               └─ Docker daemon
 ```

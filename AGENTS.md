@@ -24,7 +24,7 @@
 - `../aws-ai-proxy/` - optional independently running AWS credential proxy consumed when `AWS_AI_PROXY_ENABLED` is true (https://github.com/hrubymar10/aws-ai-proxy)
 - `scripts/vibe-session.sh` — session wrapper/cleanup
 - `scripts/git-wrapper.sh` — blocks pushes to protected branches
-- `scripts/docker-wrapper.sh` — blocks dangerous Docker subcommands in-container
+- `scripts/docker-wrapper.sh` — allowlists safe Docker subcommands, including `build` and `buildx`, and warns on sibling sandbox image tags
 - `docker-filter-proxy/` — extra validation layer in front of socket proxy
 - `config/docker-compose.local.example.yml` — local mount template
 - `test/test-vibe-docker.sh` — lightweight host-side wrapper tests

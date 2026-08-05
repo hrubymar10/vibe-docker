@@ -353,6 +353,7 @@ Current tests cover:
 - credential helper quoting
 - session PID file naming
 - wrapper behavior with mocked `docker`
+- Docker build/buildx forwarding, sandbox-image tag warnings, and non-canonical API-path rejection
 - start-time preflight/override generation with mocked `docker`
 - explicit compose project pinning
 - `docker compose config` rendering smoke test

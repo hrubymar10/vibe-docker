@@ -55,6 +55,7 @@ test: ## Run host-side integration tests
 	@echo "Running tests (branch: $(GIT_BRANCH), $(GIT_SHA))..."
 	@bash test/test-vibe-docker.sh
 	@bash test/test-vscode-wrapper.sh
+	@bash test/test-docker-wrapper.sh
 	@bash test/test-wrappers-mock.sh
 	@bash test/test-preflight-overrides.sh
 	@bash test/test-compose-config.sh
@@ -63,6 +64,7 @@ test: ## Run host-side integration tests
 test-verbose: ## Run tests with bash -x tracing
 	@bash -x test/test-vibe-docker.sh
 	@bash -x test/test-vscode-wrapper.sh
+	@bash -x test/test-docker-wrapper.sh
 	@bash -x test/test-wrappers-mock.sh
 	@bash -x test/test-preflight-overrides.sh
 	@bash -x test/test-compose-config.sh
